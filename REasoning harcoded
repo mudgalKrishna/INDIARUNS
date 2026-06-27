@@ -1,0 +1,379 @@
+import json
+import re
+from datetime import datetime
+
+# ----------------------------
+# Constants from prompt / JD
+# ----------------------------
+
+PRODUCT_COMPANIES = {
+    "swiggy", "razorpay", "cred", "zomato", "flipkart", "meesho", "nykaa", "inmobi", "byju's",
+    "policybazaar", "ola", "zoho", "vedantu", "paytm", "unacademy", "pharmeasy", "upgrad",
+    "freshworks", "phonepe", "dream11", "haptik", "yellow.ai", "sarvam ai", "mad street den",
+    "wysa", "aganitha", "niramai", "observe.ai", "krutrim", "verloop.io", "locobuzz",
+    "rephrase.ai", "saarthi.ai", "google", "microsoft", "amazon", "apple", "netflix",
+    "uber", "meta", "adobe", "salesforce", "linkedin", "glance", "genpact ai"
+}
+
+SERVICES_COMPANIES = {
+    "tcs", "infosys", "wipro", "accenture", "cognizant", "capgemini", "hcl", "mindtree",
+    "tech mahindra", "mphasis"
+}
+
+FICTIONAL_COMPANIES = {
+    "pied piper", "initech", "hooli", "wayne enterprises", "acme corp",
+    "stark industries", "globex inc", "dunder mifflin"
+}
+
+JD_SKILL_KEYWORDS = {
+    'python', 'embeddings', 'faiss', 'pinecone', 'weaviate', 'qdrant', 'milvus',
+    'elasticsearch', 'opensearch', 'pgvector', 'bm25', 'information retrieval',
+    'sentence transformers', 'bge', 'e5', 'rag', 'langchain', 'llamaindex',
+    'machine learning', 'deep learning', 'nlp', 'pytorch', 'tensorflow',
+    'scikit-learn', 'xgboost', 'lightgbm', 'mlflow', 'feature engineering',
+    'fine-tuning', 'lora', 'qlora', 'peft', 'learning to rank', 'ltr',
+    'recommendation systems', 'vector search', 'semantic search',
+    'hugging face', 'transformers', 'data science'
+}
+
+IMPORTANT_SKILLS_PRIORITY = [
+    "python", "embeddings", "vector", "vector search", "semantic search", "information retrieval",
+    "rag", "faiss", "pinecone", "weaviate", "qdrant", "milvus", "elasticsearch", "opensearch",
+    "bm25", "sentence transformers", "bge", "e5", "learning to rank", "ltr", "ndcg", "mrr", "map"
+]
+
+MODEL_ACTIVITY_WORDS = [
+    "built", "developed", "implemented", "deployed", "production", "serving",
+    "ranking", "retrieval", "recommend", "search", "nlp", "embedding", "vector",
+    "rag", "pipeline", "model", "ml"
+]
+
+# ----------------------------
+# Helpers
+# ----------------------------
+
+def safe_lower(x):
+    return (x or "").strip().lower()
+
+def load_jsonl(path):
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+def normalize_company(name):
+    return safe_lower(name)
+
+def profile_name(record):
+    prof = record.get("profile", {}) or {}
+    return prof.get("full_name") or prof.get("name") or ""
+
+def get_total_experience_years(record):
+    prof = record.get("profile", {}) or {}
+    # Use direct field if present
+    for k in ("total_experience_years", "experience_years", "years_of_experience"):
+        if isinstance(prof.get(k), (int, float)):
+            return float(prof[k])
+
+    # fallback via career months sum
+    ch = record.get("career_history", []) or []
+    months = 0
+    for r in ch:
+        dm = r.get("duration_months")
+        if isinstance(dm, (int, float)):
+            months += dm
+    if months > 0:
+        return round(months / 12.0, 1)
+    return None
+
+def get_skills(record):
+    # support both top-level and nested
+    skills = record.get("skills")
+    if skills is None:
+        skills = (record.get("profile", {}) or {}).get("skills", [])
+    return skills or []
+
+def get_skill_map(record):
+    out = {}
+    for s in get_skills(record):
+        name = safe_lower(s.get("name"))
+        if not name:
+            continue
+        out[name] = s
+    return out
+
+def best_python_months(skill_map):
+    for k, v in skill_map.items():
+        if "python" in k:
+            dm = v.get("duration_months")
+            if isinstance(dm, (int, float)):
+                return int(dm)
+    return None
+
+def get_career(record):
+    return record.get("career_history", []) or []
+
+def latest_role(record):
+    ch = get_career(record)
+    if not ch:
+        return ("Unknown title", "Unknown company", "")
+    r = ch[0]
+    return (r.get("title") or "Unknown title", r.get("company") or "Unknown company", r.get("description") or "")
+
+def classify_companies(record):
+    ch = get_career(record)
+    product = 0
+    services = 0
+    fictional = 0
+    names = []
+    for r in ch:
+        c = normalize_company(r.get("company", ""))
+        if not c:
+            continue
+        names.append(r.get("company", ""))
+        if c in PRODUCT_COMPANIES:
+            product += 1
+        if c in SERVICES_COMPANIES:
+            services += 1
+        if c in FICTIONAL_COMPANIES:
+            fictional += 1
+    return product, services, fictional, names
+
+def top_distinctive_skills(skill_map, max_n=2):
+    # pick JD-relevant skills with longest duration first
+    scored = []
+    for name, meta in skill_map.items():
+        base = 0
+        for kw in IMPORTANT_SKILLS_PRIORITY:
+            if kw in name:
+                base += 5
+        dm = meta.get("duration_months")
+        dur = dm if isinstance(dm, (int, float)) else 0
+        if base > 0:
+            scored.append((base, dur, name, meta))
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    picked = []
+    for _, _, n, m in scored:
+        picked.append((n, m))
+        if len(picked) >= max_n:
+            break
+    return picked
+
+def get_redrob_signals(record):
+    return record.get("redrob_signals", {}) or {}
+
+def behavioral_note(signals):
+    chunks = []
+    otw = signals.get("open_to_work_flag")
+    if isinstance(otw, bool):
+        chunks.append("open to work" if otw else "not open to work")
+
+    npd = signals.get("notice_period_days")
+    if isinstance(npd, (int, float)):
+        chunks.append(f"{int(npd)}-day notice")
+
+    gh = signals.get("github_activity_score")
+    if isinstance(gh, (int, float)):
+        if gh >= 0:
+            chunks.append(f"GitHub {int(gh)}/100")
+        else:
+            chunks.append("no GitHub linked")
+
+    if not chunks:
+        return ""
+    return ", ".join(chunks[:3])
+
+def extract_building_signal(latest_desc, teacher_reasoning):
+    text = f"{latest_desc or ''} {teacher_reasoning or ''}".lower()
+    # sentence-ish compact extraction
+    if "rag" in text and "retriev" in text:
+        return "built RAG/retrieval workflows"
+    if "recommend" in text:
+        return "worked on recommendation features"
+    if "predictive" in text or "churn" in text:
+        return "built predictive modeling features"
+    if "data pipeline" in text or "etl" in text or "warehouse" in text:
+        return "built data pipelines/warehouse workflows"
+    if "search" in text or "semantic" in text:
+        return "worked on search/semantic systems"
+    if "computer vision" in text or "cv" in text:
+        return "worked mainly on computer-vision systems"
+    if "qa" in text or "test automation" in text:
+        return "experience is mostly QA/test automation"
+    return "has mainly adjacent data/backend experience"
+
+def primary_concern(record, score, services_cnt, fictional_cnt, skill_map, signals):
+    # strongest disqualifier first
+    title, company, latest_desc = latest_role(record)
+    txt = f"{title} {latest_desc} {record.get('teacher_reasoning','')}".lower()
+
+    if services_cnt >= max(1, len(get_career(record))):
+        return "services-only background is a fit risk for this founding product role"
+
+    if "qa" in txt or "test automation" in txt:
+        return "career evidence is mostly QA/test work, not retrieval ML delivery"
+
+    if ("computer vision" in txt or "cv" in txt or "robotics" in txt) and ("nlp" not in txt and "retriev" not in txt):
+        return "profile appears CV-heavy without clear NLP/IR production depth"
+
+    npd = signals.get("notice_period_days")
+    if isinstance(npd, (int, float)) and npd > 60:
+        return f"{int(npd)}-day notice raises execution risk"
+
+    gh = signals.get("github_activity_score")
+    if isinstance(gh, (int, float)) and gh < 0:
+        return "no GitHub linked limits code-depth validation"
+
+    if fictional_cnt > 0:
+        return "fictional-company tenure lowers credential confidence"
+
+    # missing key signals
+    has_python = any("python" in k for k in skill_map)
+    has_retrievalish = any(any(t in k for t in ["retriev", "vector", "embedding", "rag", "search", "faiss", "pinecone", "weaviate", "qdrant", "milvus", "elasticsearch", "opensearch"]) for k in skill_map)
+    if not has_retrievalish:
+        return "no clear embedding/vector retrieval skills in profile"
+
+    if not has_python:
+        return "python depth is unclear for this Python-heavy role"
+
+    if score < 40:
+        return "overall evidence is below bar for production retrieval ownership"
+    return ""
+
+def score_band(score):
+    if score >= 70:
+        return "strong"
+    if score >= 40:
+        return "medium"
+    return "weak"
+
+def hallucination_check(reasoning, profile_skill_names_lower):
+    r = reasoning.lower()
+    for kw in JD_SKILL_KEYWORDS:
+        if kw in r:
+            if not any(kw in ps for ps in profile_skill_names_lower):
+                return False
+    return True
+
+def deterministic_fallback(record, concern):
+    title, company, _ = latest_role(record)
+    score = record.get("teacher_score", 0)
+    if score >= 70:
+        return f"{title} at {company} with stronger overall signal for this role based on profile evidence. Note: {concern or 'validate retrieval depth and availability during screening'}."
+    elif score >= 40:
+        return f"{title} at {company} shows partial alignment with data/ML-adjacent work. Note: {concern or 'retrieval/vector production depth is not clearly evidenced'}."
+    else:
+        return f"{title} at {company} has limited direct match for this Senior AI retrieval-focused role; major gaps remain versus JD. Note: {concern or 'production retrieval ownership is unclear'}."
+
+def build_reasoning(record):
+    candidate_id = record.get("candidate_id", "")
+    score = float(record.get("teacher_score", 0))
+    teacher_reasoning = record.get("teacher_reasoning", "")
+
+    title, company, latest_desc = latest_role(record)
+    skill_map = get_skill_map(record)
+    signals = get_redrob_signals(record)
+    exp_years = get_total_experience_years(record)
+    py_months = best_python_months(skill_map)
+    product_cnt, services_cnt, fictional_cnt, companies = classify_companies(record)
+
+    strong_skills = top_distinctive_skills(skill_map, max_n=2)
+    build_sig = extract_building_signal(latest_desc, teacher_reasoning)
+    concern = primary_concern(record, score, services_cnt, fictional_cnt, skill_map, signals)
+    beh = behavioral_note(signals)
+    band = score_band(score)
+
+    # strengths clause
+    strengths = []
+    if py_months is not None:
+        strengths.append(f"{py_months}mo Python")
+    for sk, meta in strong_skills:
+        if "python" in sk:
+            continue
+        dm = meta.get("duration_months")
+        if isinstance(dm, (int, float)) and dm > 0:
+            strengths.append(f"{int(dm)}mo {meta.get('name', sk)}")
+        else:
+            strengths.append(meta.get("name", sk))
+        if len(strengths) >= 2:
+            break
+    if not strengths:
+        strengths.append("ML-adjacent engineering exposure")
+
+    comp_label = "product"
+    c_norm = normalize_company(company)
+    if c_norm in SERVICES_COMPANIES:
+        comp_label = "services"
+    elif c_norm in FICTIONAL_COMPANIES:
+        comp_label = "synthetic"
+
+    if band == "strong":
+        s1 = f"{(str(exp_years)+'y') if exp_years else 'Experienced'} {title} at {company} ({comp_label}) with {', '.join(strengths[:2])}"
+        s2 = f"{build_sig}. {beh if beh else 'Availability and coding depth appear interviewable'}."
+        reasoning = f"{s1}; {s2}"
+    elif band == "medium":
+        s1 = f"{(str(exp_years)+'y') if exp_years else 'Experienced'} {title} at {company} with {', '.join(strengths[:2])}"
+        s2 = f"{build_sig}. Note: {concern if concern else 'retrieval/ranking production depth is not yet explicit'}."
+        reasoning = f"{s1}; {s2}"
+    else:
+        s1 = f"{title} background at {company} with {', '.join(strengths[:1]) if strengths else 'adjacent engineering exposure'}"
+        s2 = f"however {concern if concern else 'profile lacks clear production retrieval ownership for this JD'}."
+        reasoning = f"{s1}; {s2}"
+
+    # keep concise (2-3 sentences max)
+    reasoning = re.sub(r"\s+", " ", reasoning).strip()
+    # normalize accidental long chains
+    if reasoning.count(".") < 2 and not reasoning.endswith("."):
+        reasoning += "."
+    return candidate_id, reasoning, concern
+
+def process_all(input_paths, output_path):
+    total = 0
+    hallucination_replaced = 0
+    unique_reasonings = set()
+
+    with open(output_path, "w", encoding="utf-8") as out:
+        for ip in input_paths:
+            with open(ip, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    rec = json.loads(line)
+
+                    cid, reasoning, concern = build_reasoning(rec)
+
+                    profile_skill_names_lower = {
+                        safe_lower(s.get("name"))
+                        for s in get_skills(rec)
+                        if safe_lower(s.get("name"))
+                    }
+
+                    if not hallucination_check(reasoning, profile_skill_names_lower):
+                        reasoning = deterministic_fallback(rec, concern)
+                        hallucination_replaced += 1
+
+                    out.write(json.dumps({
+                        "candidate_id": cid,
+                        "fixed_reasoning": reasoning
+                    }, ensure_ascii=False) + "\n")
+
+                    total += 1
+                    unique_reasonings.add(reasoning)
+
+                    if total % 1000 == 0:
+                        print(f"[{datetime.now().isoformat(timespec='seconds')}] Processed {total} records...")
+
+    print("\n=== Summary ===")
+    print(f"total processed: {total}")
+    print(f"hallucinations caught and replaced: {hallucination_replaced}")
+    print(f"unique reasoning count: {len(unique_reasonings)}")
+
+if __name__ == "__main__":
+    # As requested, process the two split files from repo
+    inputs = ["candidate_split_part1.jsonl", "candidate_split_part2.jsonl"]
+    output = "fixed_reasoning.jsonl"
+    process_all(inputs, output)
